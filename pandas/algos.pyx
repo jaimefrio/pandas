@@ -1154,6 +1154,31 @@ def nancorr_spearman(ndarray[float64_t, ndim=2] mat, Py_ssize_t minp=1):
     return result
 
 #----------------------------------------------------------------------
+# Auxiliary function for roll_var, roll_skew and roll_kurt
+
+cdef inline void count_repeats(double val, double prev, double *rep,
+                               Py_ssize_t *nrep, Py_ssize_t *nobs) nogil:
+    if prev == prev:
+        # prev is not NaN, removing an observation...
+        if nobs[0] == nrep[0]:
+            # ...and removing a repeat
+            nrep[0] -= 1
+            if nrep[0] == 0:
+                rep[0] = NaN
+        nobs[0] -= 1
+
+    if val == val:
+        # next is not NaN, adding an observation...
+        if val == prev:
+            # ...and adding a repeat
+            nrep[0] += 1
+        else:
+            # ...and resetting repeats
+            nrep[0] = 1
+            rep[0] = val
+        nobs[0] += 1
+
+#----------------------------------------------------------------------
 # Rolling variance
 
 def roll_var(ndarray[double_t] input, int win, int minp, int ddof=1):
@@ -1241,67 +1266,79 @@ def roll_var(ndarray[double_t] input, int win, int minp, int ddof=1):
 
     return output
 
-
 #-------------------------------------------------------------------------------
 # Rolling skewness
 
 def roll_skew(ndarray[double_t] input, int win, int minp):
+    """
+    Numerically stable implementation using a Welford-like method.
+    """
     cdef double val, prev
-    cdef double x = 0, xx = 0, xxx = 0
-    cdef Py_ssize_t nobs = 0, i
+    cdef double mean_x = 0, sum2dm_x = 0, sum3dm_x = 0
+    cdef double delta, rep = NaN, val_prev, delta_nobs, sum_sum2dm_x
+    cdef Py_ssize_t nobs = 0, nrep = 0, i
     cdef Py_ssize_t N = len(input)
 
     cdef ndarray[double_t] output = np.empty(N, dtype=float)
 
-    # 3 components of the skewness equation
-    cdef double A, B, C, R
-
     minp = _check_minp(win, minp, N)
 
-    for i from 0 <= i < minp - 1:
+    for i from 0 <= i < N:
         val = input[i]
+        prev = NaN if i < win else input[i - win]
 
-        # Not NaN
-        if val == val:
-            nobs += 1
-            x += val
-            xx += val * val
-            xxx += val * val * val
+        # First, count the number of onservation and consecutive repeats
+        count_repeats(val, prev, &rep, &nrep, &nobs)
 
-        output[i] = NaN
-
-    for i from minp - 1 <= i < N:
-        val = input[i]
-
-        if val == val:
-            nobs += 1
-            x += val
-            xx += val * val
-            xxx += val * val * val
-
-        if i > win - 1:
-            prev = input[i - win]
+        # Then, compute the new mean and sums of squared and cubed differences
+        if nobs == nrep:
+            # All non-NaN values in window are identical...
+            sum2dm_x = sum3dm_x = 0
+            mean_x = rep if nobs > 0 else 0
+        elif val == val:
+            # Adding one observation...
             if prev == prev:
-                x -= prev
-                xx -= prev * prev
-                xxx -= prev * prev * prev
-
-                nobs -= 1
-
-        if nobs >= minp:
-            A = x / nobs
-            B = xx / nobs - A * A
-            C = xxx / nobs - A * A * A - 3 * A * B
-
-            R = sqrt(B)
-
-            if B == 0 or nobs < 3:
-                output[i] = NaN
+                # ...and removing another
+                delta_nobs = val - prev
+                delta = delta_nobs / nobs
+                prev -= mean_x
+                mean_x += delta
+                val -= mean_x
+                val_prev = val + prev
+                sum_sum2dm_x = sum2dm_x
+                sum2dm_x += delta_nobs * val_prev
+                sum_sum2dm_x += sum2dm_x
+                sum3dm_x += (0.25 * delta_nobs * delta * (nobs*nobs - 1) +
+                             0.75 * nobs * val_prev * val_prev -
+                             1.5 * sum_sum2dm_x) * delta
             else:
-                output[i] = ((sqrt(nobs * (nobs - 1.)) * C) /
-                             ((nobs-2) * R * R * R))
+                # ...and not removing any
+                delta_nobs = val - mean_x
+                delta = delta_nobs / nobs
+                mean_x += delta
+                sum3dm_x += delta * (delta_nobs*delta*(nobs-1)*(nobs-2) -
+                                    3*sum2dm_x)
+                sum2dm_x += delta_nobs * (val - mean_x)
+        elif prev == prev:
+            # Adding no new observation, but removing one
+            delta_nobs = prev - mean_x
+            delta = delta_nobs / nobs
+            sum3dm_x -= delta * (delta * delta_nobs * (nobs+1) * (nobs+2) -
+                                 3 * sum2dm_x)
+            sum2dm_x -= delta_nobs * delta * (nobs + 1)
+            mean_x -= delta
+
+        # Finally, compute and write the rolling skewness to the output array
+        if nobs >= minp:
+            if nobs < 3 or sum2dm_x == 0:
+                val = NaN
+            else:
+                val  = sum3dm_x / sum2dm_x / sqrt(sum2dm_x)
+                val *= (nobs) * sqrt(nobs - 1) / (nobs - 2)
         else:
-            output[i] = NaN
+            val = NaN
+
+        output[i] = val
 
     return output
 
@@ -1309,19 +1346,79 @@ def roll_skew(ndarray[double_t] input, int win, int minp):
 # Rolling kurtosis
 
 
-def roll_kurt(ndarray[double_t] input,
-               int win, int minp):
+def roll_kurt(ndarray[double_t] input, int win, int minp):
+    """
+    Numerically stable implementation using a Welford-like method.
+    """
     cdef double val, prev
-    cdef double x = 0, xx = 0, xxx = 0, xxxx = 0
-    cdef Py_ssize_t nobs = 0, i
+    cdef double mean_x = 0, sum2dm_x = 0, sum3dm_x = 0, sum4dm_x = 0
+    cdef double rep = NaN, delta, val_prev, delta_nobs, sum_sum2dm_x
+    cdef Py_ssize_t nobs = 0, nrep = 0, i
     cdef Py_ssize_t N = len(input)
 
     cdef ndarray[double_t] output = np.empty(N, dtype=float)
 
-    # 5 components of the kurtosis equation
-    cdef double A, B, C, D, R, K
-
     minp = _check_minp(win, minp, N)
+
+    for i from 0 <= i < N:
+        val = input[i]
+        prev = NaN if i < win else input[i - win]
+
+        # First, count the number of onservation and consecutive repeats
+        count_repeats(val, prev, &rep, &nrep, &nobs)
+
+        # Then, compute the new mean and sums of squared, cubed and
+        # tesseracted differences
+        if nobs == nrep:
+            # All non-NaN values in window are identical...
+            sum2dm_x = sum3dm_x = sum4dm_x = 0
+            mean_x = rep if nobs > 0 else 0
+        elif val == val:
+            # Adding one observation...
+            if prev == prev:
+                # ...and removing another
+                delta_nobs = val - prev
+                delta = delta_nobs / nobs
+                prev -= mean_x
+                mean_x += delta
+                val -= mean_x
+                val_prev = val + prev
+                sum_sum2dm_x = sum2dm_x
+                dif_sum2dm_x = -sum2dm_x
+                sum2dm_x += delta_nobs * val_prev
+                sum_sum2dm_x += sum2dm_x
+                dif_sum2dm_x += sum2dm_x
+                sum_sum3dm_x = sum3dm_x
+                sum3dm_x += (0.25 * delta_nobs * delta * (nobs*nobs - 1) +
+                             0.75 * nobs * val_prev * val_prev -
+                             1.5 * sum_sum2dm_x) * delta
+                sum_sum3dm_x += sum3dm_x
+                sum4dm_x = (2 * m * (val*val*val + prev*prev*prev) -
+                            delta * delta_nobs * (m-2) * (m-1) * val_prev -
+                            2 * sum_sum3dm_x - delta * dif_sum2dm_x) * delta
+            else:
+                # ...and not removing any
+                delta_nobs = val - mean_x
+                delta = delta_nobs / nobs
+                delta2 = delta * delta
+
+                sum4dm_x += (delta * delta * delta_nobs * (nobs - 1) * (
+
+                mean_x += delta
+                sum3dm_x += delta * (delta_nobs*delta*(nobs-1)*(nobs-2) -
+                                    3*sum2dm_x)
+                sum2dm_x += delta_nobs * (val - mean_x)
+        elif prev == prev:
+            # Adding no new observation, but removing one
+            delta_nobs = prev - mean_x
+            delta = delta_nobs / nobs
+            sum3dm_x -= delta * (delta * delta_nobs * (nobs+1) * (nobs+2) -
+                                 3 * sum2dm_x)
+            sum2dm_x -= delta_nobs * delta * (nobs + 1)
+            mean_x -= delta
+
+
+
 
     for i from 0 <= i < minp - 1:
         val = input[i]

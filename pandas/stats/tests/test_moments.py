@@ -301,7 +301,8 @@ class TestMoments(tm.TestCase):
         except ImportError:
             raise nose.SkipTest('no scipy')
         self._check_moment_func(mom.rolling_skew,
-                                lambda x: skew(x, bias=False))
+                                lambda x: skew(x, bias=False),
+                                test_stable=True)
 
     def test_rolling_kurt(self):
         try:
@@ -521,7 +522,7 @@ class TestMoments(tm.TestCase):
         self.assertTrue(np.abs(result - 1) < 1e-2)
 
         s = Series([1.0, 2.0, 4.0, 8.0])
-        
+
         expected = Series([1.0, 1.6, 2.736842, 4.923077])
         for f in [lambda s: mom.ewma(s, com=2.0, adjust=True),
                   lambda s: mom.ewma(s, com=2.0, adjust=True, ignore_na=False),
@@ -1027,7 +1028,7 @@ class TestMoments(tm.TestCase):
         assert_frame_equal(result2, expected)
         assert_frame_equal(result3, expected)
         assert_frame_equal(result4, expected)
-    
+
     def test_pairwise_stats_column_names_order(self):
         # GH 7738
         df1s = [DataFrame([[2,4],[1,2],[5,2],[8,1]], columns=[0,1]),
